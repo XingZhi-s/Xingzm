@@ -1,0 +1,616 @@
+// 依赖：01-state.js, 02-core.js
+import { DEFAULT_AVATAR, state, uid } from './01-state.js';
+import { $, countdownAnniversary, dbAll, dbDel, dbGet, dbPut, escapeHtml, formatTime, inputDialog, now, pick, randInt, toast } from './02-core.js';
+import { autoResize, cancelRoundTimers, renderChatMessages } from './04-chat.js';
+import { renderLetterList } from './05-call-letter.js';
+import { openContactSetting, renderContactSettingsList, renderMyStickersGrid, renderStickerPanel, renderThemeUI } from './06-ui.js';
+import { renderHomeAvatar, renderStorageStats, renderTodos } from './07-diy-todo.js';
+
+// ============ 我的资料读写 ============
+export async function getMe() {
+  let m = await dbGet('me', 'profile');
+  if (!m) {
+    m = { k:'profile', name:'我', avatar:DEFAULT_AVATAR, stickers:[] };
+    await dbPut('me', m);
+  }
+  // 迁移修复：旧版默认头像fill被二次编码(%2523)导致解析失败显示黑色，替换为新默认头像
+  if (m.avatar && m.avatar.indexOf('%2523') !== -1) {
+    m.avatar = DEFAULT_AVATAR;
+    await dbPut('me', m);
+  }
+  return m;
+}
+export async function saveMe(m) { m.k = 'profile'; await dbPut('me', m); }
+
+export async function getTheme() {
+  let t = await dbGet('me', 'theme');
+  if (!t) {
+    t = { k:'theme', themeColor:'#6b8aff', background:{type:'color', value:'#f5f6fa'}, customCSS:'' };
+    await dbPut('me', t);
+  }
+  return t;
+}
+export async function saveTheme(t) { t.k = 'theme'; await dbPut('me', t); applyTheme(t); }
+
+// ============ 联系人读写 ============
+export async function getAllContacts() { return await dbAll('contacts'); }
+export async function getContact(id) { return await dbGet('contacts', id); }
+export async function saveContact(c) { await dbPut('contacts', c); }
+export async function deleteContact(id) { await dbDel('contacts', id); }
+
+// ============ 状态大类（固定四类；数据按配置存，便于以后扩展第五类） ============
+const STATUS_CATEGORY_KEY = 'status_categories_v1';
+export const STATUS_CATEGORY_DEFAULTS = [
+  // unread / readNoReply = 不回复时的拆分比例（和为 100），类内所有状态共用
+  { id: 'present', name: '在场', unread: 10, readNoReply: 90 },
+  { id: 'leisure', name: '悠闲', unread: 25, readNoReply: 75 },
+  { id: 'event', name: '事件中', unread: 70, readNoReply: 30 },
+  { id: 'sleep', name: '睡觉', unread: 100, readNoReply: 0 },
+];
+const BUILTIN_STATUS_CATEGORY = { '在身边': 'present', '吃饭中': 'leisure', '睡觉中': 'sleep', '忙碌中': 'event' };
+
+export async function getStatusCategories() {
+  const rec = await dbGet('meta', STATUS_CATEGORY_KEY);
+  const saved = (rec && Array.isArray(rec.list)) ? rec.list : [];
+  const out = STATUS_CATEGORY_DEFAULTS.map(d => {
+    const s = saved.find(x => x && x.id === d.id);
+    return {
+      id: d.id, name: d.name,
+      unread: typeof s?.unread === 'number' ? Math.max(0, Math.min(100, s.unread)) : d.unread,
+      readNoReply: typeof s?.readNoReply === 'number' ? Math.max(0, Math.min(100, s.readNoReply)) : d.readNoReply,
+    };
+  });
+  // 配置里出现的新大类（未来扩展）保留下来
+  for (const s of saved) if (s && s.id && !STATUS_CATEGORY_DEFAULTS.some(d => d.id === s.id)) out.push(s);
+  return out;
+}
+export async function saveStatusCategories(list) {
+  await dbPut('meta', { k: STATUS_CATEGORY_KEY, list: list.map(c => ({ id: c.id, name: c.name, unread: c.unread, readNoReply: c.readNoReply })) });
+}
+
+// ============ 状态共享池（内置 + 自定义，所有联系人通用） ============
+const STATUS_POOL_KEY = 'status_pool_v1';
+export const DEFAULT_STATUSES = [
+  { name: '在身边', category: 'present', replyRate: 100 },
+  { name: '吃饭中', category: 'leisure', replyRate: 50 },
+  { name: '睡觉中', category: 'sleep', replyRate: 5 },
+  { name: '忙碌中', category: 'event', replyRate: 20 },
+];
+function normalizePoolItem(s, cats) {
+  let category = s.category;
+  if (!category || !cats.some(c => c.id === category)) category = BUILTIN_STATUS_CATEGORY[s.name] || 'present';
+  return { id: s.id || uid(), name: s.name, category, replyRate: typeof s.replyRate === 'number' ? s.replyRate : 50 };
+}
+export async function getStatusPool() {
+  const rec = await dbGet('meta', STATUS_POOL_KEY);
+  const cats = await getStatusCategories();
+  let pool = (rec && Array.isArray(rec.list)) ? rec.list.slice() : [];
+  if (!pool.length) pool = DEFAULT_STATUSES.map(s => ({ id: uid(), name: s.name, category: s.category, replyRate: s.replyRate }));
+  let merged = !rec;
+  const fixed = pool.map(s => {
+    const n = normalizePoolItem(s, cats);
+    if (!s.id || s.category !== n.category || typeof s.replyRate !== 'number') merged = true;
+    return n;
+  });
+  pool = fixed;
+  // 兼容旧数据 / 导入数据：联系人本地列表里的自定义状态并入共享池
+  const contacts = await getAllContacts();
+  for (const c of contacts) {
+    for (const s of (c.statusList || [])) {
+      if (!s || !s.name || pool.some(p => p.name === s.name)) continue;
+      pool.push(normalizePoolItem(s, cats));
+      merged = true;
+    }
+  }
+  if (merged) await dbPut('meta', { k: STATUS_POOL_KEY, list: pool });
+  return pool;
+}
+// 写回共享池并同步给所有联系人（列表一致；当前状态失效时随机取一个）
+export async function saveStatusPool(pool) {
+  await dbPut('meta', { k: STATUS_POOL_KEY, list: pool });
+  const contacts = await getAllContacts();
+  const list = pool.map(s => ({ id: s.id, name: s.name, category: s.category, replyRate: s.replyRate }));
+  for (const c of contacts) {
+    c.statusList = list.slice();
+    if (!c.statusId || !pool.some(s => s.id === c.statusId)) {
+      const s = pool.find(x => x.name === c.status) || (pool.length ? pick(pool) : null);
+      c.statusId = s ? s.id : '';
+      c.status = s ? s.name : '';
+    }
+    await saveContact(c);
+  }
+}
+// 渲染/打开联系人前调用：列表与共享池对齐，状态为空或不在池内 → 池内随机并保存
+export async function normalizeContactStatus(c, pool) {
+  const p = pool || await getStatusPool();
+  const list = p.map(s => ({ id: s.id, name: s.name, category: s.category, replyRate: s.replyRate }));
+  const cur = c.statusList || [];
+  const listSame = cur.length === list.length && list.every((s, i) => cur[i] && cur[i].name === s.name && cur[i].replyRate === s.replyRate && cur[i].category === s.category);
+  let changed = false;
+  if (!listSame) { c.statusList = list; changed = true; }
+  // statusId 为主；为空/失效时按旧 status 名回填，或随机取一个
+  const byName = p.find(s => s.name === c.status);
+  if (!c.statusId || !p.some(s => s.id === c.statusId)) {
+    const s = byName || (p.length ? pick(p) : null);
+    c.statusId = s ? s.id : '';
+    if (s && c.status !== s.name) c.status = s.name;
+    changed = true;
+  } else if (byName) {
+    const curStatus = p.find(s => s.id === c.statusId);
+    if (curStatus && byName.id !== c.statusId) {
+      // 旧数据/导入数据/外部直接改 status 名：以有效名字为准，同步 statusId
+      c.statusId = byName.id;
+      changed = true;
+    }
+  } else {
+    // 当前 status 名不在共享池内 → 池内随机取一个并写回（不再出现「未设置状态」）
+    const s = p.length ? pick(p) : null;
+    c.statusId = s ? s.id : '';
+    c.status = s ? s.name : '';
+    changed = true;
+  }
+  const t = now();
+  // nextStatusAt 为主，nextStatusChangeAt 保留同步（旧数据/导入数据兼容）
+  if (!c.nextStatusAt) { c.nextStatusAt = c.nextStatusChangeAt || (t + randInt(120, 480) * 60 * 1000); changed = true; }
+  if (c.nextStatusChangeAt !== c.nextStatusAt) { c.nextStatusChangeAt = c.nextStatusAt; changed = true; }
+  // 负间隔保护（系统时间回拨）：状态起点不能晚于下一切换点
+  if (!c.statusSince || c.statusSince > c.nextStatusAt) {
+    c.statusSince = Math.min(t, c.nextStatusAt - 1000);
+    if (!c.statusSince || c.statusSince > c.nextStatusAt) c.statusSince = c.nextStatusAt - 1000;
+    changed = true;
+  }
+  if (!Array.isArray(c.statusSchedule)) { c.statusSchedule = []; changed = true; }
+  if (!Array.isArray(c.pendingReplies)) { c.pendingReplies = []; changed = true; }
+  if (c.statusSchedule.length > 50) { c.statusSchedule = c.statusSchedule.slice(-50); changed = true; }
+  if (changed) await saveContact(c);
+  return c;
+}
+// 作息表写入（单次内存追加；随联系人一次保存落库；最多 50 条）
+export function recordStatusWindow(c, statusId, from, to) {
+  if (!statusId || !from || !to || to <= from) return false;
+  c.statusSchedule = c.statusSchedule || [];
+  c.statusSchedule.push({ statusId, from, to });
+  if (c.statusSchedule.length > 50) c.statusSchedule = c.statusSchedule.slice(-50);
+  return true;
+}
+
+
+export function createEmptyContact(name) {
+  return {
+    id: uid(),
+    name: name || '新联系人',
+    createdAt: now(), // 用于「经期提醒过期不补」：在这轮提醒时间点之后新建的联系人不补发
+    avatar: DEFAULT_AVATAR,
+    // 默认状态从共享池的内置项里随机取（不再固定第一个）
+    status: pick(DEFAULT_STATUSES).name,
+    statusId: '', // 由 normalizeContactStatus 对齐共享池
+    statusAuto: true,
+    statusSince: now(),
+    nextStatusAt: now() + randInt(120, 480) * 60 * 1000,
+    nextStatusChangeAt: now() + randInt(120, 480) * 60 * 1000,
+    statusSchedule: [], // 最近 50 段作息 { statusId, from, to }
+    pendingReplies: [], // 挂起队列 { id, sectionId, msgIds, sentAt, statusId, windows }
+    statusList: [
+      { id: uid(), name: '在身边', category: 'present', replyRate: 100 },
+      { id: uid(), name: '吃饭中', category: 'leisure', replyRate: 50 },
+      { id: uid(), name: '睡觉中', category: 'sleep', replyRate: 5 },
+      { id: uid(), name: '忙碌中', category: 'event', replyRate: 20 },
+    ],
+    settings: {
+      fastSec: 5, slowMin: 3, replyCount: 1,
+      replyCountMin: 1, replyCountMax: 1,
+      incomingCall: true, proactiveMsg: false,
+      callRate: 50, // 每天主动来电概率（0–100 整数，默认 50；老数据缺省按 50 处理）
+      proactiveMin: 1, proactiveMax: 3,
+      nextProactiveAt: now() + randInt(2, 8) * 3600 * 1000,
+      chatBackground: null,
+      myNickname: '',
+      letterEnabled: false, nextLetterAt: null
+    },
+    letterDay: null, // 当日主动来信是否已判定：'YYYY-M-D'
+    cardGroups: [],
+    stickers: [],
+    anniversaries: [],
+    messages: [],
+    letters: [],
+    missedCalls: [],
+    unread: 0,
+    callSlots: null, // 当日来电槽位：{date, slots:[{contactId,time}]}
+  };
+}
+
+// ============ 主题应用 ============
+export function applyTheme(theme) {
+  const r = document.documentElement;
+  const c = theme.themeColor || '#6b8aff';
+  r.style.setProperty('--theme-color', c);
+  // 衍生浅色
+  r.style.setProperty('--theme-light', hexToRgba(c, 0.12));
+  r.style.setProperty('--my-bubble', c);
+
+  const bg = theme.background;
+  const hasBgImage = !!(bg && bg.type === 'image');
+  const isDefaultBg = !bg || (bg.type === 'color' && bg.value === '#f5f6fa');
+  const bgPos = theme.backgroundPos || 'center';
+
+  // 背景（图片优先）
+  if (hasBgImage) {
+    document.body.style.background = `url("${bg.value}") ${bgPos}/cover no-repeat fixed`;
+  } else if (!isDefaultBg) {
+    document.body.style.background = bg.value;
+  } else {
+    // 无自定义背景 → 交给 :root 的 --theme-bg-light 与主题色联动
+    document.body.style.removeProperty('background');
+  }
+
+  // 全局主题色穿透：底层背景始终是半透明主题色叠加层。
+  // A22：有壁纸/全局背景图时不再清空变量（清空会让所有二级页回落到 transparent，换色完全不可见）；
+  // 壁纸仍在最底层（body 背景图），主题色以 8% 半透明叠在其上，换色可见且不压掉壁纸。
+  r.style.setProperty('--theme-bg-light', hexToRgba(c, 0.08));
+
+  // 主题色穿透：无全局背景图时，页面/顶栏/设置项等基础底色都跟随主题浅色
+  if (hasBgImage) {
+    r.style.removeProperty('--bg-color');
+    r.style.removeProperty('--card-bg');
+    r.style.removeProperty('--border-color');
+  } else {
+    r.style.setProperty('--bg-color', tintOnWhite(c, isDefaultBg ? 0.10 : 0.06));
+    r.style.setProperty('--card-bg', tintOnWhite(c, 0.04));
+    r.style.setProperty('--border-color', tintOnWhite(c, 0.16));
+  }
+
+  // 自定义CSS
+  const old = document.getElementById('user-css');
+  if (old) old.remove();
+  if (theme.customCSS) {
+    const s = document.createElement('style');
+    s.id = 'user-css';
+    s.textContent = theme.customCSS;
+    document.head.appendChild(s);
+  }
+}
+// 将主题色按透明度混合到白色上，得到不透明浅色（alpha 越大越接近主题色）
+export function tintOnWhite(hex, alpha) {
+  let h = hex.replace('#', '');
+  if (h.length === 3) h = h.split('').map(x => x + x).join('');
+  const rr = parseInt(h.slice(0, 2), 16), gg = parseInt(h.slice(2, 4), 16), bb = parseInt(h.slice(4, 6), 16);
+  const mix = v => Math.round(255 - (255 - v) * alpha);
+  return `rgb(${mix(rr)},${mix(gg)},${mix(bb)})`;
+}
+export function hexToRgba(hex, a) {
+  let h = hex.replace('#','');
+  if (h.length === 3) h = h.split('').map(c => c+c).join('');
+  const r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+// ============ 我的资料简要渲染 ============
+export async function renderMeBrief() {
+  const m = await getMe();
+  const av = $('sidebar-avatar'); if (av) av.src = m.avatar || DEFAULT_AVATAR;
+  const n = $('sidebar-name'); if (n) n.textContent = m.name;
+  const ma = $('me-avatar'); if (ma) ma.src = m.avatar || DEFAULT_AVATAR;
+  const mn = $('me-name'); if (mn) mn.textContent = m.name;
+}
+
+// ============ 页面切换 ============
+// A25：保留底部导航的一级页（其余页面隐藏导航；一级页不加顶部返回键）
+const NAV_KEEP_PAGES = ['page-home', 'page-love', 'page-letter', 'page-me', 'page-setting'];
+// 七个伪应用：记录「点开之前的那一页」，返回时回到来源
+const PSEUDO_APP_PAGES = ['page-mood', 'page-inspiration', 'page-divine', 'page-reader', 'page-music', 'page-diy', 'page-period', 'page-notice'];
+
+export function openPage(id, pushPrev=false) {
+  const prevId = state.lastPage;
+  if (pushPrev && prevId && prevId !== id) state.prevPage = prevId;
+  if (PSEUDO_APP_PAGES.includes(id) && prevId && prevId !== id && !PSEUDO_APP_PAGES.includes(prevId)) {
+    state.appReturnPage = prevId;
+  }
+  // 关闭聊天菜单等
+  $('chat-menu').classList.add('hide');
+  $('sticker-panel').classList.add('hide');
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const pg = $(id);
+  if (pg) pg.classList.add('active');
+  // 聊天页激活时手机端隐藏底部导航栏
+  document.body.classList.toggle('page-chat-active', id === 'page-chat');
+  // 其余二级页隐藏底部导航栏；五个一级页保留导航
+  document.body.classList.toggle('nav-hidden-page', !NAV_KEEP_PAGES.includes(id));
+  // 底部导航状态
+  document.querySelectorAll('.bottom-nav .nav-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.page === id);
+  });
+  // 进入me页时刷新显示
+  if (id === 'page-me') {
+    renderMeBrief();
+    if (window.refreshLockSettingUI) window.refreshLockSettingUI();
+  }
+  if (id === 'page-letter') renderLetterList();
+  if (id === 'page-setting') {
+    renderThemeUI(getThemeSync());
+    renderStorageStats();
+    // 全站存储用量 / 持久化状态（由 12-music.js 挂载，进入设置页时刷新）
+    if (window.renderGlobalStorage) window.renderGlobalStorage();
+  }
+  if (id === 'page-my-stickers') renderMyStickersGrid();
+  if (id === 'page-contact-settings-list') renderContactSettingsList();
+  if (id === 'page-wallet' && window.renderWalletPage) window.renderWalletPage();
+  if (id === 'page-wallet-ledger' && window.renderWalletLedger) window.renderWalletLedger();
+  if (id === 'page-contact-wallet' && window.renderContactWalletSettings) window.renderContactWalletSettings();
+  if (id === 'page-love' || id === 'page-chat') renderContacts();
+  // 手机桌面第二页的心情日历小组件（只渲染当月，数据复用 09-mood.js）
+  if (id === 'page-home' && window.renderLoveMoodCalendar) window.renderLoveMoodCalendar();
+  if (id === 'page-home') { renderHomeAvatar(); renderTodos(); }
+  state.lastPage = id;
+  // A26：切页触发一次补算（聊天页由 openChat 在进入前 await，避免二次插入）
+  if (id !== 'page-chat' && typeof window.__runCatchUp === 'function') {
+    try {
+      const p = window.__runCatchUp();
+      // 补算可能补出今天的心情记录，完成后刷新一次小日历
+      if (p && typeof p.then === 'function') {
+        p.then(() => {
+          if (state.lastPage === 'page-home' && window.renderLoveMoodCalendar) window.renderLoveMoodCalendar();
+        }).catch(() => {});
+      }
+    } catch (e) { /* 静默 */ }
+  }
+  // 页面切换后刷新迷你播放条（由 12-music.js 挂载）
+  if (window.updateMusicMiniBar) window.updateMusicMiniBar();
+}
+// A25：伪应用返回 → 回到进入前的那一页；桌面下不能落到被隐藏的手机首页/联系人列表
+export function backFromApp(fallback='page-home') {
+  const isDesktop = window.matchMedia('(min-width: 900px)').matches;
+  const src = state.appReturnPage;
+  state.appReturnPage = null;
+  if (src && src !== state.lastPage && (!isDesktop || (src !== 'page-home' && src !== 'page-love'))) {
+    return openPage(src);
+  }
+  // 桌面端回到聊天区（有联系人则保持聊天，空态则显示选择联系人）
+  return openPage(isDesktop ? 'page-chat' : fallback);
+}
+export function getThemeSync() {
+  // 用于页面渲染时快速获取（非异步），实际存储用async
+  return { themeColor: getComputedStyle(document.documentElement).getPropertyValue('--theme-color').trim() || '#6b8aff' };
+}
+
+// ============ 联系人列表渲染（手机版 + 电脑侧栏） ============
+export function filterContacts(query) { renderContacts(query); }
+export async function renderContacts(search='') {
+  const list = await getAllContacts();
+  // A25：状态来自共享池；为空/不在池内时随机取一个并写回
+  const pool = await getStatusPool();
+  for (const c of list) await normalizeContactStatus(c, pool);
+  const q = (search || '').trim().toLowerCase();
+  const filtered = q ? list.filter(c => c.name.toLowerCase().includes(q)) : list;
+  // 按最后消息时间倒序
+  filtered.sort((a,b) => {
+    const la = a.messages.length ? a.messages[a.messages.length-1].time : 0;
+    const lb = b.messages.length ? b.messages[b.messages.length-1].time : 0;
+    return lb - la;
+  });
+  const renderCard = (c) => {
+    const last = c.messages.length ? c.messages[c.messages.length-1] : null;
+    let preview = last ? (last.type === 'text' ? last.content : last.type === 'image' ? '[图片]' : last.type === 'sticker' ? '[表情包]' : last.type === 'choice' ? '[选择]' : last.type === 'reminder' ? '[提醒] ' + (last.reminder && last.reminder.text || last.content) : last.type === 'musicInvite' ? '[一起听] ' + ((last.musicInvite && last.musicInvite.trackName) || '本地歌曲') : '') : '还没有消息，点击开始聊天';
+    const anni = getNearestAnniversary(c.anniversaries);
+    const anniHtml = anni ? `<div class="contact-card-anni">${anni.text}</div>` : '';
+    const mc = (c.missedCalls && c.missedCalls.length > 0) ? `<div class="missed-call-badge"><svg class="i i-sm" style="margin-right:2px;"><use href="#icon-phone"/></svg>${c.missedCalls.length}个未接</div>` : '';
+    const unread = c.unread ? `<span class="badge" style="margin-left:4px;"></span>` : '';
+    return `<div class="contact-card" onclick="openChat('${c.id}')">
+      <img class="avatar" src="${escapeHtml(c.avatar || DEFAULT_AVATAR)}" alt="">
+      <div class="contact-card-info">
+        <div class="contact-card-name">${escapeHtml(c.name)}${unread}</div>
+        <div class="contact-card-status">
+          ${c.status ? `<span class="status-dot" style="background:var(--success);"></span>${escapeHtml(c.status)}` : ''}
+        </div>
+        <div class="contact-card-preview ellipsis">${escapeHtml(preview)}</div>
+        ${anniHtml}
+      </div>
+      <div style="text-align:right;flex-shrink:0;">
+        <div class="contact-card-time">${last ? formatTime(last.time) : ''}</div>
+      </div>
+      ${mc}
+    </div>`;
+  };
+  const html = filtered.length ? filtered.map(renderCard).join('') : `<div class="empty">还没有联系人，点击右上角"+"新建</div>`;
+  const mc = $('mobile-contacts'); if (mc) mc.innerHTML = html;
+  const sc = $('sidebar-contacts'); if (sc) sc.innerHTML = filtered.length ? filtered.map(renderCard).join('') : `<div class="empty" style="font-size:13px;">暂无联系人</div>`;
+}
+export function getNearestAnniversary(list) {
+  if (!list || !list.length) return null;
+  let min = Infinity, nearest = null;
+  for (const a of list) {
+    const r = countdownAnniversary(a.date);
+    if (!r) continue;
+    if (r.diff < min) { min = r.diff; nearest = { ...a, diff: r.diff, today: r.todayIsOrigin }; }
+  }
+  if (!nearest) return null;
+  const t = nearest.today ? '就是今天' : (nearest.diff === 0 ? '就是今天' : (nearest.diff > 0 ? `还有${nearest.diff}天` : `已过${Math.abs(nearest.diff)}天`));
+  return { name: nearest.name, text: `${escapeHtml(nearest.name)} · ${t}` };
+}
+
+// ============ 新建联系人 ============
+export async function createNewContact() {
+  const r = await inputDialog('新建联系人', [{ key:'name', label:'联系人名字', placeholder:'请输入名字', required:true }]);
+  if (!r) return;
+  const nm = (r.name || '').trim() || '新联系人';
+  const c = createEmptyContact(nm);
+  await saveContact(c);
+  renderContacts();
+  toast('联系人已创建');
+  // 进入聊天
+  openChat(c.id);
+}
+
+// 专属称呼替换：把文本中的 [我的名字] / [昵称] / {name} 替换为专属称呼（未设置则用我的名字）
+export async function applyNickname(text, c) {
+  if (!text) return text;
+  if (!/\[我的名字\]|\[昵称\]|\{name\}/.test(text)) return text;
+  const nick = (c.settings && c.settings.myNickname) || (await getMe()).name || '我';
+  return text.replace(/\[我的名字\]|\[昵称\]|\{name\}/g, nick);
+}
+// 回复概率：直接使用每个状态的 replyRate 属性（0-100 整数百分比）
+// 颜色映射：按概率区间给出绿→红的状态点颜色
+export function rateColor(rate) {
+  const r = Number(rate) || 0;
+  if (r >= 90) return '#10b981';  // 秒回级：绿
+  if (r >= 60) return '#3b82f6';  // 常回级：蓝
+  if (r >= 30) return '#f59e0b';  // 看心情：黄橙
+  if (r >= 10) return '#f97316';  // 很少回：橙
+  return '#6b7280';                // <10%：灰（离线/不理）
+}
+
+// ============ 退出聊天模式（左栏点击我/设置时调用，电脑端回到空态） ============
+export function exitChatMode() {
+  if (!state.currentContactId) return;
+  const prevId = state.currentContactId;
+  cancelRoundTimers(prevId);
+  delete state.replyRounds[prevId];
+  state.chatTypingState[prevId] = false;
+  state.currentContactId = null;
+  for (const k in state.chatTimers) { clearTimeout(state.chatTimers[k]); delete state.chatTimers[k]; }
+  // 切换空态显示
+  const isDesktop = window.matchMedia('(min-width: 900px)').matches;
+  if (isDesktop) {
+    const ec = $('empty-chat');
+    const cw = $('chat-content-wrap');
+    if (ec) ec.classList.add('show');
+    if (cw) cw.classList.add('hide');
+  }
+}
+// ============ 打开聊天 ============
+export async function openChat(contactId) {
+  // A26：进入聊天页之前一次性完成补算并落库，进入后不再二次插入
+  if (typeof window.__runCatchUp === 'function') {
+    try { await window.__runCatchUp(contactId); } catch (e) { console.warn('进入聊天前补算失败：', e); }
+  }
+  // 钱包红包：只补算当前这一位联系人，不参与全局 60 秒补算
+  if (typeof window.__walletOnChatOpen === 'function') {
+    try { await window.__walletOnChatOpen(contactId); } catch (e) { console.warn('进入聊天前红包补算失败：', e); }
+  }
+  state.currentContactId = contactId;
+  const c = await getContact(contactId);
+  if (!c) return;
+  await normalizeContactStatus(c);
+  c.unread = 0;
+  if (c.missedCalls && c.missedCalls.length > 0) {
+    toast(`${c.name}有${c.missedCalls.length}个未接来电`);
+    // 对齐：补算出问题或旧数据只有计数没有提示时，进入会话就补一条可见提示；
+    // 已有未查看提示则直接复用，并把它们标记为已查看，避免下次进来重复插入
+    const msgs = c.messages || (c.messages = []);
+    const pending = msgs.filter(m => m.sysKey && String(m.sysKey).startsWith('missed:') && !m.sysAck);
+    if (!pending.length) {
+      const mt = now();
+      msgs.push({
+        id: uid(), from: 'other', type: 'text', content: `${c.name}（未接来电）`,
+        time: mt, replyTo: null, snapshot: null, read: true, readAt: mt, replyAt: 0, replied: true,
+        sysKey: 'missed:' + c.missedCalls[c.missedCalls.length - 1], sysAck: false
+      });
+      c.unread = (c.unread || 0) + 1;
+    }
+    for (const m of msgs) {
+      if (m.sysKey && String(m.sysKey).startsWith('missed:')) m.sysAck = true;
+    }
+    c.missedCalls = [];
+  }
+  await saveContact(c);
+  // 清红点后立刻刷新联系人列表（含手机端与电脑侧栏）
+  renderContacts();
+  // 先激活聊天页（激活display:flex）
+  openPage('page-chat');
+  // 显示聊天内容，隐藏空态（电脑端）
+  const ec = $('empty-chat');
+  const cw = $('chat-content-wrap');
+  if (ec) ec.classList.remove('show');
+  if (cw) {
+    cw.classList.remove('hide');
+    cw.style.display = 'flex';
+    cw.style.flexDirection = 'column';
+    cw.style.flex = '1';
+    cw.style.minHeight = '0';
+    cw.style.overflow = 'hidden';
+  }
+  // 渲染顶栏
+  $('chat-header-name').textContent = c.name;
+  const rate = getCurrentReplyRate(c);
+  $('chat-header-status').innerHTML = c.status
+    ? `<span class="status-dot" style="background:${rateColor(rate)};"></span>${escapeHtml(c.status)}`
+    : '';
+  state.loadMoreState[contactId] = { loaded: false, pageSize: 50 };
+  await renderChatMessages(contactId, true);
+  applyChatBg(c);
+  renderStickerPanel();
+  $('chat-input-box').value = '';
+  autoResize($('chat-input-box'));
+}
+export function tierColor(t) {
+  // 旧 tierColor 兼容：将 tier 转换为概率后用 rateColor
+  const tierMap = { '秒回': 97, '常回': 80, '看心情': 50, '很少回': 20, '不理人': 5 };
+  const r = (typeof t === 'number') ? t : (tierMap[t] != null ? tierMap[t] : 50);
+  return rateColor(r);
+}
+export function applyChatBg(c) {
+  const msgs = $('chat-messages');
+  if (!msgs) return;
+  const bg = c.settings && c.settings.chatBackground;
+  const pos = (c.settings && c.settings.chatBgPos) || 'center';
+  let val = '';
+  if (bg) {
+    if (bg.type === 'color') val = bg.value;
+    else if (bg.type === 'image') val = `url("${bg.value}") ${pos}/cover no-repeat fixed`;
+  }
+  // 防覆盖：联系人单独设置的聊天背景以行内 !important 写入，优先级高于全局主题背景 / 全局自定义 CSS
+  if (val) msgs.style.setProperty('background', val, 'important');
+  else {
+    msgs.style.removeProperty('background');
+    msgs.style.removeProperty('background-image');
+  }
+}
+export function getCurrentReplyRate(c) {
+  if (!c.statusList || !c.status) return 50; // 默认50%
+  const s = c.statusList.find(x => x.name === c.status);
+  // 兼容老 tier 数据：若无replyRate则从tier映射
+  if (s) {
+    if (typeof s.replyRate === 'number') return s.replyRate;
+    const tierMap = { '秒回': 97, '常回': 80, '看心情': 50, '很少回': 20, '不理人': 5 };
+    return tierMap[s.tier] != null ? tierMap[s.tier] : 50;
+  }
+  return 50;
+}
+export function getReplyRateOf(c, statusName) {
+  if (!c.statusList || !statusName) return 50;
+  const s = c.statusList.find(x => x.name === statusName);
+  if (s) {
+    if (typeof s.replyRate === 'number') return s.replyRate;
+    const tierMap = { '秒回': 97, '常回': 80, '看心情': 50, '很少回': 20, '不理人': 5 };
+    return tierMap[s.tier] != null ? tierMap[s.tier] : 50;
+  }
+  return 50;
+}
+export function backFromChat() {
+  const wasDesktop = window.matchMedia('(min-width: 900px)').matches;
+  const prevId = state.currentContactId;
+  if (prevId) { cancelRoundTimers(prevId); delete state.replyRounds[prevId]; state.chatTypingState[prevId] = false; }
+  state.currentContactId = null;
+  for (const k in state.chatTimers) { clearTimeout(state.chatTimers[k]); delete state.chatTimers[k]; }
+  if (wasDesktop) {
+    // 电脑端：回到空态
+    const ec = $('empty-chat');
+    const cw = $('chat-content-wrap');
+    if (ec) ec.classList.add('show');
+    if (cw) cw.classList.add('hide');
+  } else {
+    // 手机端：回到love页
+    openPage('page-love');
+  }
+  // 返回列表时刷新列表，确保红点/预览/时间是最新状态
+  renderContacts();
+}
+// 聊天设置按钮直接打开（避免onclick内async await无法等待的问题）
+export function openContactSettingsFromChatDirect() {
+  if (!state.currentContactId) return;
+  openContactSetting(state.currentContactId, 'page-chat');
+}
+
+export async function openContactSettingsFromChat() {
+  if (!state.currentContactId) return;
+  await openContactSetting(state.currentContactId, 'page-chat');
+}
